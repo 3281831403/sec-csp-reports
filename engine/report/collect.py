@@ -1,9 +1,40 @@
 """CSP 违规报告收集引擎。
 
-本模块是仓库中唯一的实现文件，只暴露 8 个公开函数，全部为待实现桩。
+本模块是仓库中唯一的实现文件，只暴露 8 个公开函数。
 外部输入一律视为不可信：解析、规范化、清洗、限流、校验必须显式完成。
 所有时间均由调用方以毫秒时间戳显式传入，不读取系统时钟，不使用随机数。
 """
+
+import hashlib
+import json
+from urllib.parse import urlsplit, urlunsplit
+
+_REPORT_KEYS = frozenset({"directive", "blocked_url", "source", "timestamp_ms"})
+_STRING_FIELDS = ("directive", "blocked_url", "source")
+
+
+def _is_int(value):
+    """严格判断整数，排除 bool（bool 是 int 的子类）。"""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_positive_int(value):
+    return _is_int(value) and value > 0
+
+
+def _split_url(url):
+    """解析 URL，保证 scheme 为 http/https 且存在主机名。"""
+    if not isinstance(url, str):
+        raise ValueError("URL 必须是字符串")
+    try:
+        parsed = urlsplit(url)
+    except ValueError as exc:
+        raise ValueError("URL 解析失败") from exc
+    if parsed.scheme.lower() not in ("http", "https"):
+        raise ValueError("URL scheme 必须是 http 或 https")
+    if not parsed.hostname:
+        raise ValueError("URL 必须是绝对地址")
+    return parsed
 
 
 def parse_report(body):
@@ -29,7 +60,40 @@ def parse_report(body):
     返回：
         dict，键为 directive、blocked_url、source、timestamp_ms。
     """
-    raise NotImplementedError
+    if not isinstance(body, str) or body == "":
+        raise ValueError("body 必须是非空字符串")
+
+    try:
+        data = json.loads(body)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("body 不是合法的 JSON") from exc
+
+    if not isinstance(data, dict):
+        raise ValueError("报告必须是 JSON 对象")
+
+    if set(data.keys()) != _REPORT_KEYS:
+        raise ValueError("报告字段缺失或多余")
+
+    directive = data["directive"]
+    blocked_url = data["blocked_url"]
+    source = data["source"]
+    timestamp_ms = data["timestamp_ms"]
+
+    if not isinstance(directive, str) or directive == "":
+        raise ValueError("directive 必须是非空字符串")
+
+    _split_url(blocked_url)
+    _split_url(source)
+
+    if not _is_int(timestamp_ms) or timestamp_ms < 0:
+        raise ValueError("timestamp_ms 必须是非负整数")
+
+    return {
+        "directive": directive,
+        "blocked_url": blocked_url,
+        "source": source,
+        "timestamp_ms": timestamp_ms,
+    }
 
 
 def dedup_key(report):
@@ -47,7 +111,20 @@ def dedup_key(report):
     - report 不是 dict、字段缺失或类型不对时抛出 ValueError，容差为 0。
     - 该键用于同一批次内的重复告警合并：相同键只计一次。
     """
-    raise NotImplementedError
+    if not isinstance(report, dict):
+        raise ValueError("report 必须是 dict")
+
+    directive = report.get("directive")
+    source = report.get("source")
+
+    if not isinstance(directive, str):
+        raise ValueError("directive 必须是字符串")
+    if not isinstance(source, str):
+        raise ValueError("source 必须是字符串")
+
+    normalized_directive = " ".join(directive.split()).lower()
+    material = normalized_directive + "\n" + normalize_url(source)
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
 def normalize_url(url):
@@ -66,7 +143,23 @@ def normalize_url(url):
     - 示例：HTTPS://CDN.Example:443/a.js?x=1#frag 规范化为
       https://cdn.example/a.js?x=1
     """
-    raise NotImplementedError
+    parsed = _split_url(url)
+    scheme = parsed.scheme.lower()
+
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("URL 端口非法") from exc
+
+    host = parsed.hostname.lower()
+    # urlsplit 会去掉 IPv6 字面量的方括号，重建时必须补回。
+    netloc = "[{}]".format(host) if ":" in host else host
+
+    default_port = 80 if scheme == "http" else 443
+    if port is not None and port != default_port:
+        netloc = "{}:{}".format(netloc, port)
+
+    return urlunsplit((scheme, netloc, parsed.path, parsed.query, ""))
 
 
 def aggregate(reports, bucket_ms):
@@ -84,7 +177,19 @@ def aggregate(reports, bucket_ms):
     - 本函数不去重、不限流、不清洗：重复报告由调用方先按 dedup_key 去掉，
       来源风控由 rate_limit 负责。
     """
-    raise NotImplementedError
+    if not _is_positive_int(bucket_ms):
+        raise ValueError("bucket_ms 必须是正整数")
+
+    counts = {}
+    for report in reports:
+        if not isinstance(report, dict):
+            raise ValueError("report 必须是 dict")
+        timestamp_ms = report.get("timestamp_ms")
+        if not _is_int(timestamp_ms) or timestamp_ms < 0:
+            raise ValueError("timestamp_ms 必须是非负整数")
+        start = (timestamp_ms // bucket_ms) * bucket_ms
+        counts[start] = counts.get(start, 0) + 1
+    return counts
 
 
 def rate_limit(source, policy, now):
@@ -107,7 +212,51 @@ def rate_limit(source, policy, now):
     - 结果完全由 counters、source、policy 与 now 决定；不读取系统时钟，
       不使用模块级全局状态。
     """
-    raise NotImplementedError
+    normalized_source = normalize_url(source)
+
+    if not isinstance(policy, dict):
+        raise ValueError("policy 必须是 dict")
+
+    limit = policy.get("limit")
+    window_ms = policy.get("window_ms")
+    counters = policy.get("counters")
+
+    if not _is_positive_int(limit):
+        raise ValueError("limit 必须是正整数")
+    if not _is_positive_int(window_ms):
+        raise ValueError("window_ms 必须是正整数")
+    if not isinstance(counters, dict):
+        raise ValueError("counters 必须是 dict")
+    if not _is_int(now) or now < 0:
+        raise ValueError("now 必须是非负整数")
+
+    timestamps = counters.get(normalized_source, [])
+    if not isinstance(timestamps, list):
+        raise ValueError("counters 中的计数必须是 list")
+
+    # 只保留落在 (now - window_ms, now] 的记录，过期计数不再占用窗口。
+    window_start = now - window_ms
+    active = [ts for ts in timestamps if _is_int(ts) and ts > window_start]
+
+    if len(active) < limit:
+        active.append(now)
+        counters[normalized_source] = active
+        return True
+
+    # 即使拒绝本次，也要把清理后的计数写回，避免过期记录永久残留。
+    counters[normalized_source] = active
+    return False
+
+
+def _escape_html(value):
+    """先转义 &，再转义尖括号与引号，避免二次转义或漏转义。"""
+    return (
+        value.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#x27;")
+    )
 
 
 def sanitize(report):
@@ -124,7 +273,25 @@ def sanitize(report):
       parse_report 负责，来源信任由 validate_policy 与调用方负责。
     - 容差为 0：不吞异常，不静默丢弃字段，不把非字符串字段强制转成字符串。
     """
-    raise NotImplementedError
+    if not isinstance(report, dict):
+        raise ValueError("report 必须是 dict")
+
+    cleaned = dict(report)
+
+    for field in _STRING_FIELDS:
+        if field in cleaned:
+            value = cleaned[field]
+            if not isinstance(value, str):
+                raise ValueError("{} 必须是字符串".format(field))
+            cleaned[field] = _escape_html(value)
+
+    if "timestamp_ms" not in cleaned:
+        raise ValueError("timestamp_ms 缺失")
+    timestamp_ms = cleaned["timestamp_ms"]
+    if not _is_int(timestamp_ms) or timestamp_ms < 0:
+        raise ValueError("timestamp_ms 必须是非负整数")
+
+    return cleaned
 
 
 def validate_policy(policy):
@@ -145,7 +312,42 @@ def validate_policy(policy):
       missing_dedup、missing_rate_limit、missing_source_validation。
     - 本函数只校验策略配置本身，不读取报告、不修改 policy。
     """
-    raise NotImplementedError
+    if not isinstance(policy, dict):
+        raise ValueError("policy 必须是 dict")
+
+    problems = []
+
+    if policy.get("dedup") is not True:
+        problems.append("missing_dedup")
+
+    rate = policy.get("rate_limit")
+    rate_ok = (
+        isinstance(rate, dict)
+        and _is_positive_int(rate.get("limit"))
+        and _is_positive_int(rate.get("window_ms"))
+    )
+    if not rate_ok:
+        problems.append("missing_rate_limit")
+
+    trusted_sources = policy.get("trusted_sources")
+    sources_ok = (
+        isinstance(trusted_sources, list)
+        and len(trusted_sources) > 0
+        and all(isinstance(item, str) for item in trusted_sources)
+    )
+    if sources_ok:
+        for item in trusted_sources:
+            try:
+                if normalize_url(item) != item:
+                    sources_ok = False
+                    break
+            except ValueError:
+                sources_ok = False
+                break
+    if not sources_ok:
+        problems.append("missing_source_validation")
+
+    return problems
 
 
 def report_batch(batches, policy):
@@ -170,4 +372,71 @@ def report_batch(batches, policy):
       total 为所有批次 kept 之和。
     - 结果必须与逐个批次单独处理等价；不得修改入参 batches 与 policy。
     """
-    raise NotImplementedError
+    problems = validate_policy(policy)
+    if problems:
+        raise ValueError(problems)
+
+    if not isinstance(batches, list):
+        raise ValueError("batches 必须是 list")
+
+    rate_policy = policy["rate_limit"]
+    results = []
+    total = 0
+
+    for batch in batches:
+        if not isinstance(batch, dict):
+            raise ValueError("批次必须是 dict")
+
+        bucket_ms = batch.get("bucket_ms")
+        reports = batch.get("reports")
+
+        if not _is_positive_int(bucket_ms):
+            raise ValueError("bucket_ms 必须是正整数")
+        if not isinstance(reports, list):
+            raise ValueError("reports 必须是 list")
+
+        # 每个批次独立的限流计数，绝不跨批次复用。
+        counters = {}
+
+        seen = set()
+        kept_reports = []
+        for report in reports:
+            if not isinstance(report, dict):
+                raise ValueError("report 必须是 dict")
+            key = dedup_key(report)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            source = report.get("source")
+            timestamp_ms = report.get("timestamp_ms")
+            if not _is_int(timestamp_ms) or timestamp_ms < 0:
+                raise ValueError("timestamp_ms 必须是非负整数")
+
+            allowed = rate_limit(
+                source,
+                {
+                    "limit": rate_policy["limit"],
+                    "window_ms": rate_policy["window_ms"],
+                    "counters": counters,
+                },
+                timestamp_ms,
+            )
+            if allowed:
+                kept_reports.append(report)
+
+        counts = aggregate(kept_reports, bucket_ms)
+        kept = len(kept_reports)
+        dropped = len(reports) - kept
+        total += kept
+
+        results.append(
+            {
+                "bucket_ms": bucket_ms,
+                "counts": counts,
+                "kept": kept,
+                "dropped": dropped,
+            }
+        )
+
+    return {"batches": results, "total": total}
